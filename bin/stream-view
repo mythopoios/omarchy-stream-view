@@ -34,6 +34,14 @@ set -uo pipefail
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/stream-view"
 SNAP="$STATE_DIR/snapshot.json"
 BORROWED="$STATE_DIR/borrowed.json"
+
+# Mode the streaming display sits at when no client is connected. Any client
+# that connects resizes it to its own resolution (see client-start).
+IDLE_MODE="${STREAM_VIEW_IDLE_MODE:-1920x1080@60}"
+# The streaming display is parked this far to the right of every real monitor,
+# so neither windows nor the pointer can drift onto a screen nobody can see.
+PARK_GAP=5000
+SUNSHINE_UNIT="app-dev.lizardbyte.app.Sunshine.service"
 # Optional: point at a Sunshine config to learn which output it captures and
 # which port it listens on. Absent or unreadable is fine; everything degrades.
 SUNSHINE_CONF="${SUNSHINE_CONF:-$HOME/.config/sunshine/sunshine.conf}"
@@ -176,19 +184,130 @@ release_all() {
 
 # --- commands --------------------------------------------------------------
 
+# Somewhere to the right of every real monitor, so nothing drifts onto it.
+park_x() {
+  local edge
+  edge="$(monitors_json | jq -r '[.[]|select(.name|test("^HEADLESS")|not)|(.x + .width)]|max // 0')"
+  echo $(( edge + PARK_GAP ))
+}
+
+set_mode() { # output, WxH@R
+  hyprctl eval "hl.monitor({ output = \"$1\", mode = \"$2\", position = \"$(park_x)x0\", scale = 1 })" >/dev/null 2>&1
+}
+
 cmd_ensure() {
   local hl; hl="$(headless)"
-  if [ -n "$hl" ]; then log "streaming display present: $hl"; return 0; fi
-  hyprctl output create headless >/dev/null 2>&1
-  sleep 0.5
-  hl="$(headless)"
-  if [ -n "$hl" ]; then
-    log "created headless output $hl"
-    log "point Sunshine's output_name at $hl for it to be captured"
-  else
-    log "could not create a headless output"
-    return 1
+
+  if [ -z "$hl" ]; then
+    hyprctl output create headless >/dev/null 2>&1
+    sleep 0.5
+    hl="$(monitors_json | jq -r '[.[]|select(.name|test("^HEADLESS"))|.name]|last // empty')"
+    [ -n "$hl" ] || { log "could not create a headless output"; return 1; }
+    set_mode "$hl" "$IDLE_MODE"
+    log "created streaming display $hl at $IDLE_MODE"
+    return 0
   fi
+
+  # Present already: leave it exactly as it is. Something else may be managing
+  # its mode and position (a monitor-profile daemon, a login script), and
+  # moving an output that another tool also positions is how you get two
+  # things fighting over the layout on every monitor event.
+  return 0
+}
+
+# --- one-shot Sunshine wiring ----------------------------------------------
+#
+# Everything above works on a headless output that Sunshine is actually
+# capturing. Getting Sunshine there means three settings, so this does it in
+# one go rather than leaving the reader a checklist. It refuses to touch a
+# config that is already pointed somewhere valid.
+
+conf_set() { # key, value — replace the key's line, or append it
+  local key="$1" value="$2"
+  if grep -qE "^[[:space:]]*$key[[:space:]]*=" "$SUNSHINE_CONF"; then
+    sed -i -E "s|^([[:space:]]*$key[[:space:]]*=[[:space:]]*).*$|\1$value|" "$SUNSHINE_CONF"
+  else
+    printf '%s = %s\n' "$key" "$value" >> "$SUNSHINE_CONF"
+  fi
+}
+
+cmd_setup() {
+  local hl want current
+
+  [ -w "$SUNSHINE_CONF" ] || [ -w "$(dirname "$SUNSHINE_CONF")" ] || {
+    log "cannot write $SUNSHINE_CONF — is Sunshine installed?"; return 1; }
+  touch "$SUNSHINE_CONF" 2>/dev/null
+
+  # Already pointed at a real headless output? Leave a working setup alone.
+  want="$(conf_value output_name)"
+  if [ -n "$want" ] && monitors_json | jq -e --arg o "$want" 'any(.[]; .name == $o and (.name|test("^HEADLESS")))' >/dev/null 2>&1; then
+    log "Sunshine is already capturing $want — nothing to change"
+    return 0
+  fi
+
+  cmd_ensure || return 1
+  hl="$(monitors_json | jq -r '[.[]|select(.name|test("^HEADLESS"))|.name]|last // empty')"
+  [ -n "$hl" ] || { log "no streaming display to point Sunshine at"; return 1; }
+
+  cp "$SUNSHINE_CONF" "$SUNSHINE_CONF.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null
+
+  # wlr-screencopy is the only backend that can see a headless output on
+  # wlroots compositors; KMS enumerates real connectors only.
+  current="$(conf_value capture)"
+  [ -n "$current" ] && [ "$current" != "wlr" ] \
+    && log "note: capture was '$current'; setting it to wlr so the headless output is visible"
+  conf_set capture wlr
+  conf_set output_name "$hl"
+
+  log "pointed Sunshine at $hl (backup written next to sunshine.conf)"
+
+  install_autostart
+
+  if systemctl --user restart "$SUNSHINE_UNIT" 2>/dev/null; then
+    log "restarted Sunshine"
+  else
+    log "restart Sunshine yourself for this to take effect"
+  fi
+}
+
+# A headless output does not survive a compositor restart, so without this the
+# streaming display would be gone at the next login. Omarchy's own Sunshine
+# installer wires autostart the same way.
+install_autostart() {
+  local file="$HOME/.config/hypr/autostart.lua" self line
+  self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  line="o.exec_on_start(\"bash -lc '\\\"$self\\\" ensure'\")"
+
+  [ -d "$(dirname "$file")" ] || { log "no Hyprland config dir; skipping autostart"; return 0; }
+  touch "$file" 2>/dev/null || { log "cannot write $file; skipping autostart"; return 0; }
+
+  if grep -qF "stream-view" "$file" 2>/dev/null; then
+    log "autostart entry already present"
+    return 0
+  fi
+
+  printf '\n-- Recreate the Stream View streaming display each session.\n%s\n' "$line" >> "$file"
+  log "added an autostart entry to ${file/#$HOME/\~}"
+}
+
+# Called by Sunshine's prep-cmd, when configured: size the streaming display to
+# the connecting client so the remote gets its own native resolution.
+cmd_client_start() {
+  local hl w h f
+  hl="$(headless)"; [ -n "$hl" ] || return 0
+  w="${SUNSHINE_CLIENT_WIDTH:-}"; h="${SUNSHINE_CLIENT_HEIGHT:-}"; f="${SUNSHINE_CLIENT_FPS:-60}"
+  if [[ "$w" =~ ^[0-9]+$ && "$h" =~ ^[0-9]+$ && "$f" =~ ^[0-9]+$ ]] \
+     && (( w >= 320 && h >= 240 && w <= 7680 && h <= 4320 && f >= 24 && f <= 240 )); then
+    set_mode "$hl" "${w}x${h}@${f}"
+    log "streaming display sized to ${w}x${h}@${f}"
+  fi
+  cmd_snapshot
+}
+
+cmd_client_stop() {
+  cmd_restore
+  local hl; hl="$(headless)"
+  [ -n "$hl" ] && set_mode "$hl" "$IDLE_MODE"
 }
 
 cmd_show() {
@@ -347,7 +466,23 @@ case "${1:-}" in
   restore)  cmd_restore ;;
   session)  cmd_session ;;
   ensure)   cmd_ensure ;;
+  setup)    cmd_setup ;;
+  client-start) cmd_client_start ;;
+  client-stop)  cmd_client_stop ;;
   *)
-    echo "usage: $(basename "$0") {status [--json]|show <n>|desktop|snapshot|restore|session|ensure}" >&2
+    cat >&2 <<USAGE
+usage: $(basename "$0") <command>
+
+  status [--json]   readiness, what is on the stream, monitor list
+  show <n>          put physical monitor n on the stream
+  desktop           hand back any borrowed workspace
+  snapshot          record the current layout
+  restore           put everything back
+  session           "active" or "idle"
+  ensure            create and park the streaming display if missing
+  setup             point Sunshine at the streaming display (one-off)
+  client-start      size the display to the connecting client, then snapshot
+  client-stop       restore, then return the display to its idle mode
+USAGE
     exit 64 ;;
 esac

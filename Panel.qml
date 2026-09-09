@@ -37,10 +37,21 @@ Panel {
   readonly property string iconMonitor: "󰍹"
   readonly property string iconDesktop: "󰇄"
   readonly property string iconRecover: "󰑐"
+  readonly property string iconSetup: "󰅱"
   readonly property string iconBar: streaming === "none" ? "󰤴" : "󰤷"
+
+  // Setup creates a display and restarts Sunshine, so it takes a moment and
+  // the button says so rather than looking like it did nothing.
+  property bool busy: false
 
   function run(args) { if (root.bar) root.bar.run(root.tool + " " + args) }
   function refresh() { if (!statusProc.running) statusProc.running = true }
+
+  function runSetup() {
+    if (busy) return
+    busy = true
+    setupProc.running = true
+  }
 
   function applyStatus(text) {
     try {
@@ -74,6 +85,18 @@ Panel {
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.applyStatus(text) }
   }
 
+  Process {
+    id: setupProc
+    command: [root.tool, "setup"]
+    onExited: {
+      root.busy = false
+      // Sunshine has just been restarted; give it a beat before believing the
+      // first status reading.
+      setupSettle.restart()
+    }
+  }
+
+  Timer { id: setupSettle; interval: 1500; repeat: false; onTriggered: root.refresh() }
   Timer { id: settleTimer; interval: 350; repeat: false; onTriggered: root.refresh() }
   Timer { interval: 4000; running: root.opened; repeat: true; onTriggered: root.refresh() }
 
@@ -182,17 +205,38 @@ Panel {
           }
         }
 
-        // ---------- Not ready: explain instead of offering dead buttons ----------
-        Text {
+        // ---------- Not ready: explain, and offer to fix it ----------
+        Column {
           visible: !root.ready
           width: parent.width
-          textFormat: Text.PlainText
-          text: root.reason.length > 0 ? root.reason
-            : "Sunshine needs a headless output to capture before this can switch monitors."
-          color: Qt.darker(root.bar.foreground, 1.4)
-          font.family: root.bar.fontFamily
-          font.pixelSize: Style.font.bodySmall
-          wrapMode: Text.WordWrap
+          spacing: Style.space(10)
+
+          Text {
+            width: parent.width
+            textFormat: Text.PlainText
+            text: root.busy
+              ? "Creating the streaming display and pointing Sunshine at it..."
+              : "Sunshine needs a display of its own to capture. Setting up creates one off to the side, points Sunshine at it, and restarts Sunshine."
+            color: Qt.darker(root.bar.foreground, 1.4)
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
+
+          Button {
+            width: parent.width
+            iconText: root.iconSetup
+            iconSize: Style.font.title
+            text: root.busy ? "Setting up..." : "Set up"
+            fontSize: Style.font.bodySmall
+            foreground: root.bar.foreground
+            fontFamily: root.bar.fontFamily
+            horizontalPadding: Style.spacing.controlPaddingX
+            verticalPadding: Style.spacing.controlPaddingY + Style.space(4)
+            bordered: true
+            enabled: !root.busy
+            onClicked: root.runSetup()
+          }
         }
 
         // ---------- Monitor pickers ----------

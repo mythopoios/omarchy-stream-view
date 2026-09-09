@@ -37,20 +37,8 @@ does not re-pin workspace ranges.
 ## Requirements
 
 - Hyprland 0.56 or newer, for the Lua dispatch API
-- Sunshine, capturing a headless output
+- Sunshine, already installed and paired with your Moonlight client
 - `jq` and `hyprctl` on `PATH`; `ss` (from `iproute2`) for session detection
-
-Sunshine must be pointed at a headless output. If you do not have one, the panel
-will say so, and you can create one with:
-
-```bash
-~/.config/omarchy/plugins/io.github.mythopoios.stream-view/bin/stream-view ensure
-```
-
-Then set `output_name` in `sunshine.conf` to the output it reports and restart
-Sunshine. Creating the output at login, and sizing it per client, is outside
-this plugin's job — see Sunshine's docs, or any of the community scripts that
-manage a persistent virtual display for Hyprland.
 
 ## Install
 
@@ -63,6 +51,20 @@ Then place it wherever you like on the bar:
 ```bash
 omarchy bar move io.github.mythopoios.stream-view --section right
 ```
+
+Open the panel. If Sunshine is not yet capturing a display of its own, the panel
+says so and offers a **Set up** button. That one click:
+
+- creates a headless output and parks it well off to the side, where neither
+  windows nor the pointer can wander onto it
+- sets `capture = wlr` and `output_name` in `sunshine.conf`, keeping a
+  timestamped backup of the original
+- adds a line to `~/.config/hypr/autostart.lua` so the display comes back after
+  a reboot, since headless outputs do not survive a compositor restart
+- restarts Sunshine
+
+If Sunshine is already pointed at a headless output — because you set one up
+yourself — Set up does not appear and nothing is touched.
 
 ## How the buttons behave
 
@@ -87,14 +89,29 @@ snapshots your layout when a client connects, and restores it when the client
 goes away. Nothing outside the plugin folder is touched, so uninstalling is just
 removing the directory.
 
-If you would rather have exact timing, Sunshine can drive it directly. Add this
-to `global_prep_cmd` in `sunshine.conf`, alongside anything already there:
+If you would rather have exact timing, and want the streaming display to match
+each client's own resolution, Sunshine can drive it directly. Add this to
+`global_prep_cmd` in `sunshine.conf`, alongside anything already there:
 
 ```json
-{"do":"<plugin-dir>/bin/stream-view snapshot","undo":"<plugin-dir>/bin/stream-view restore"}
+{"do":"<plugin-dir>/bin/stream-view client-start","undo":"<plugin-dir>/bin/stream-view client-stop"}
 ```
 
-Both paths are idempotent, so running both is harmless.
+`client-start` sizes the display to the connecting client before snapshotting,
+so a 16:9 laptop and a tablet each get their own native resolution rather than
+one fixed mode. Both paths are idempotent, so running both is harmless.
+
+## Uninstall
+
+```bash
+omarchy plugin remove io.github.mythopoios.stream-view
+```
+
+If you used **Set up**, two things live outside the plugin folder and are yours
+to remove if you want them gone: the `stream-view` line in
+`~/.config/hypr/autostart.lua`, and `output_name` in `sunshine.conf` (the
+timestamped backup next to it is from before the change). Leaving them does no
+harm — Sunshine falls back to capturing a physical monitor.
 
 ## Command line
 
@@ -108,7 +125,10 @@ stream-view desktop           hand back any borrowed workspace
 stream-view snapshot          record the current layout
 stream-view restore           put everything back
 stream-view session           "active" or "idle"
-stream-view ensure            create a headless output if none exists
+stream-view ensure            create and park the streaming display if missing
+stream-view setup             point Sunshine at it (what the Set up button runs)
+stream-view client-start      size the display to the client, then snapshot
+stream-view client-stop       restore, then return the display to idle
 ```
 
 State lives in `$XDG_STATE_HOME/stream-view` (usually `~/.local/state`).
