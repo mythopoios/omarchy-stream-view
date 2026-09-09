@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.mythopoios.stream-view",
+  "name": "Stream View",
+  "version": "1.0.0",
+  "author": "mythopoios",
+  "license": "MIT",
+  "homepage": "https://github.com/mythopoios/omarchy-stream-view",
+  "description": "Choose which physical monitor your Moonlight client sees. Puts a monitor's workspace on the Sunshine stream at the client's own resolution, and puts it back when you disconnect.",
+  "kinds": [
+    "bar-widget",
+    "service"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "Stream View",
+    "description": "Switch the Moonlight stream between your physical monitors, or release it back to its own desktop.",
+    "category": "Compositor",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

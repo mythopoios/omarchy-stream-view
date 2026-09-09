@@ -1,0 +1,353 @@
+#!/usr/bin/env bash
+# stream-view — choose which physical monitor a Sunshine/Moonlight client sees.
+#
+# Sunshine captures ONE output. This tool borrows a whole workspace from a
+# physical monitor onto the headless output Sunshine is capturing, so the remote
+# client sees that monitor's contents — with the windows re-tiled to the
+# client's resolution rather than mirrored and letterboxed.
+#
+# Why whole workspaces instead of individual windows:
+#   * hl.dsp.workspace.move relocates a workspace with its layout intact in a
+#     single dispatch, and it survives `hyprctl reload`, so a config reload
+#     (hotplug, monitor daemons) cannot drag a borrowed workspace back mid-stream.
+#   * Windows never leave their workspace, so "put it back" is always well
+#     defined and no per-window bookkeeping can go stale.
+#   * Runtime `hl.workspace_rule` edits do NOT survive reload, which is why
+#     re-pinning whole ranges is not used here.
+#
+# Commands:
+#   status [--json]   report readiness, which monitor is on the stream, topology
+#   show <n>          borrow physical monitor n's active workspace onto the stream
+#   desktop           return borrowed workspaces; show the stream's own desktop
+#   snapshot          record the layout (call when a client connects)
+#   restore           put everything back (call when a client disconnects)
+#   session           print "active" or "idle" — is a client streaming right now
+#   ensure            create a headless output if none exists
+#
+# Monitors are numbered by position, top-to-bottom then left-to-right, so the
+# numbering is stable even when connector names (DP-1, HDMI-A-1) change between
+# boots. Nothing here is specific to any machine's monitor layout.
+#
+# Requires: hyprctl (Hyprland 0.56+, for the Lua dispatch API), jq.
+set -uo pipefail
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/stream-view"
+SNAP="$STATE_DIR/snapshot.json"
+BORROWED="$STATE_DIR/borrowed.json"
+# Optional: point at a Sunshine config to learn which output it captures and
+# which port it listens on. Absent or unreadable is fine; everything degrades.
+SUNSHINE_CONF="${SUNSHINE_CONF:-$HOME/.config/sunshine/sunshine.conf}"
+
+mkdir -p "$STATE_DIR"
+[ -s "$BORROWED" ] || echo '[]' > "$BORROWED"
+
+log() { printf '[stream-view] %s\n' "$*" >&2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+for dep in hyprctl jq; do
+  have "$dep" || { log "missing required command: $dep"; exit 127; }
+done
+
+# --- topology --------------------------------------------------------------
+
+monitors_json() { hyprctl monitors -j 2>/dev/null; }
+
+conf_value() { # key
+  [ -r "$SUNSHINE_CONF" ] || return 0
+  awk -v k="$1" '$1==k || $1==k"=" {print $NF; exit}' "$SUNSHINE_CONF" 2>/dev/null |
+    tr -d '"' | tr -d "'"
+}
+
+# The output Sunshine captures. Prefer its configured output_name when that
+# output actually exists; otherwise fall back to any headless output present.
+headless() {
+  local want
+  want="$(conf_value output_name)"
+  if [ -n "$want" ] && monitors_json | jq -e --arg o "$want" 'any(.[]; .name == $o)' >/dev/null 2>&1; then
+    printf '%s' "$want"; return 0
+  fi
+  monitors_json | jq -r '[.[]|select(.name|test("^HEADLESS"))|.name]|last // empty'
+}
+
+# Physical (non-headless) monitors, ordered top-to-bottom then left-to-right.
+phys_names() {
+  monitors_json | jq -r '
+    [ .[] | select(.name | test("^HEADLESS") | not) ]
+    | sort_by(.y, .x) | .[].name'
+}
+
+phys_name() { phys_names | sed -n "${1}p"; }
+
+mon_desc() { monitors_json | jq -r --arg n "$1" '.[]|select(.name==$n)|.description // empty'; }
+mon_exists() { monitors_json | jq -e --arg n "$1" 'any(.[]; .name == $n)' >/dev/null 2>&1; }
+active_ws_on() { monitors_json | jq -r --arg n "$1" '.[]|select(.name==$n)|.activeWorkspace.id // empty'; }
+ws_monitor() { hyprctl workspaces -j 2>/dev/null | jq -r --arg id "$1" '.[]|select(.id==($id|tonumber))|.monitor // empty'; }
+
+# A workspace's home per its workspace_rule, when one exists. Only a fallback:
+# many setups have no per-monitor workspace rules at all.
+ws_rule_home() {
+  hyprctl workspacerules -j 2>/dev/null |
+    jq -r --arg id "$1" '.[]|select(.workspaceString==$id)|.monitor // empty'
+}
+
+# --- primitives ------------------------------------------------------------
+
+move_ws() { # workspace-id, monitor-selector
+  [ -n "${2:-}" ] || return 1
+  hyprctl dispatch "hl.dsp.workspace.move({ workspace = $1, monitor = \"$2\" })" >/dev/null 2>&1
+}
+
+focus_monitor() { hyprctl dispatch "hl.dsp.focus({ monitor = \"$1\" })" >/dev/null 2>&1; }
+focus_ws() { hyprctl dispatch "hl.dsp.focus({ workspace = $1 })" >/dev/null 2>&1; }
+
+# --- borrow bookkeeping ----------------------------------------------------
+#
+# The origin monitor is recorded when a workspace is borrowed. That record — not
+# a workspace_rule — is what sends it home, so this works on setups that pin
+# nothing. The rule and the snapshot are consulted only as fallbacks.
+
+borrow_record() { # ws, origin-name, origin-desc
+  local tmp; tmp="$(mktemp "$STATE_DIR/.borrowed.XXXXXX")"
+  jq --argjson ws "$1" --arg name "$2" --arg desc "$3" \
+    'map(select(.ws != $ws)) + [{ws: $ws, name: $name, desc: $desc}]' \
+    "$BORROWED" > "$tmp" 2>/dev/null && mv "$tmp" "$BORROWED" || rm -f "$tmp"
+}
+
+borrow_forget() { # ws
+  local tmp; tmp="$(mktemp "$STATE_DIR/.borrowed.XXXXXX")"
+  jq --argjson ws "$1" 'map(select(.ws != $ws))' "$BORROWED" > "$tmp" 2>/dev/null \
+    && mv "$tmp" "$BORROWED" || rm -f "$tmp"
+}
+
+# Where should workspace $1 go home to? Recorded origin, then snapshot, then rule.
+home_for() { # ws
+  local ws="$1" home
+
+  home="$(jq -r --argjson ws "$ws" '.[]|select(.ws==$ws)|.name // empty' "$BORROWED" 2>/dev/null)"
+  if [ -n "$home" ] && mon_exists "$home"; then printf '%s' "$home"; return 0; fi
+
+  # Recorded monitor is gone (unplugged): try its description.
+  home="$(jq -r --argjson ws "$ws" '.[]|select(.ws==$ws)|.desc // empty' "$BORROWED" 2>/dev/null)"
+  if [ -n "$home" ]; then printf 'desc:%s' "$home"; return 0; fi
+
+  if [ -s "$SNAP" ]; then
+    home="$(jq -r --argjson ws "$ws" '.workspaces[]?|select(.id==$ws)|.monitor // empty' "$SNAP" 2>/dev/null)"
+    if [ -n "$home" ] && mon_exists "$home"; then printf '%s' "$home"; return 0; fi
+  fi
+
+  home="$(ws_rule_home "$ws")"
+  [ -n "$home" ] && printf '%s' "$home"
+}
+
+# Workspaces sitting on the headless output that belong somewhere else.
+borrowed_ids() {
+  local hl; hl="$(headless)"
+  [ -n "$hl" ] || return 0
+  {
+    jq -r '.[].ws' "$BORROWED" 2>/dev/null
+    # Orphan sweep: anything on the headless output with a rule pointing at a
+    # real monitor, in case the state file was lost.
+    local id rule
+    while read -r id; do
+      [ -n "$id" ] || continue
+      rule="$(ws_rule_home "$id")"
+      [ -n "$rule" ] && [ "$rule" != "$hl" ] && echo "$id"
+    done < <(hyprctl workspaces -j 2>/dev/null | jq -r --arg hl "$hl" '.[]|select(.monitor==$hl)|.id')
+  } | sort -un | while read -r id; do
+    [ -n "$id" ] || continue
+    # Only report it as borrowed if it is actually on the headless output now.
+    [ "$(ws_monitor "$id")" = "$hl" ] && echo "$id"
+  done
+}
+
+release_all() {
+  local id home
+  while read -r id; do
+    [ -n "$id" ] || continue
+    home="$(home_for "$id")"
+    if [ -n "$home" ]; then
+      move_ws "$id" "$home" && log "returned workspace $id"
+    else
+      log "workspace $id has no known home; leaving it"
+    fi
+    borrow_forget "$id"
+  done < <(borrowed_ids)
+}
+
+# --- commands --------------------------------------------------------------
+
+cmd_ensure() {
+  local hl; hl="$(headless)"
+  if [ -n "$hl" ]; then log "streaming display present: $hl"; return 0; fi
+  hyprctl output create headless >/dev/null 2>&1
+  sleep 0.5
+  hl="$(headless)"
+  if [ -n "$hl" ]; then
+    log "created headless output $hl"
+    log "point Sunshine's output_name at $hl for it to be captured"
+  else
+    log "could not create a headless output"
+    return 1
+  fi
+}
+
+cmd_show() {
+  local n="${1:-}"
+  [[ "$n" =~ ^[0-9]+$ ]] || { log "usage: stream-view show <monitor-number>"; exit 64; }
+
+  local hl name ws desc
+  hl="$(headless)"
+  [ -n "$hl" ] || { log "no streaming display found; run: stream-view ensure"; exit 1; }
+
+  name="$(phys_name "$n")"
+  [ -n "$name" ] || { log "no physical monitor #$n"; exit 1; }
+
+  # Already showing this monitor: nothing to do.
+  local shown; shown="$(cmd_streaming_index)"
+  if [ "$shown" = "$n" ]; then focus_monitor "$hl"; log "already streaming monitor $n"; return 0; fi
+
+  # Establish a baseline if the session watcher has not got to it yet, so the
+  # very first borrow of a session is still recoverable.
+  [ -s "$SNAP" ] || cmd_snapshot
+
+  # Return whatever is borrowed first, then read the target's active workspace,
+  # so switching between monitors picks up the right one.
+  release_all
+  ws="$(active_ws_on "$name")"
+  [ -n "$ws" ] || { log "monitor $n ($name) has no active workspace"; exit 1; }
+
+  desc="$(mon_desc "$name")"
+  borrow_record "$ws" "$name" "$desc"
+  move_ws "$ws" "$hl"
+  focus_monitor "$hl"
+  log "streaming monitor $n ($name), workspace $ws"
+}
+
+cmd_desktop() {
+  local hl; hl="$(headless)"
+  release_all
+  [ -n "$hl" ] && focus_monitor "$hl"
+  log "stream returned to its own desktop"
+}
+
+cmd_snapshot() {
+  local ws mon
+  ws="$(hyprctl workspaces -j 2>/dev/null)"
+  mon="$(monitors_json)"
+  [ -n "$ws" ] && [ -n "$mon" ] || { log "could not read layout"; return 1; }
+  jq -n --argjson ws "$ws" --argjson mon "$mon" '{
+    ts: now,
+    workspaces: ($ws | map({id, monitor})),
+    active:     ($mon | map({monitor: .name, ws: .activeWorkspace.id}))
+  }' > "$SNAP" 2>/dev/null && log "snapshot saved"
+}
+
+cmd_restore() {
+  # Recorded origins first — correct even with no workspace rules anywhere.
+  release_all
+
+  # Then re-apply the snapshot, which also restores each monitor's active
+  # workspace. Moves are skipped when a workspace is already in place.
+  if [ -s "$SNAP" ]; then
+    local id mon
+    while IFS=$'\t' read -r id mon; do
+      [ -n "$id" ] && [ -n "$mon" ] || continue
+      mon_exists "$mon" || continue
+      [ "$(ws_monitor "$id")" = "$mon" ] && continue
+      move_ws "$id" "$mon"
+    done < <(jq -r '.workspaces[]?|select(.monitor!=null)|"\(.id)\t\(.monitor)"' "$SNAP" 2>/dev/null)
+
+    while read -r id; do
+      [ -n "$id" ] || continue
+      focus_ws "$id"
+    done < <(jq -r '.active[]?|select(.monitor|test("^HEADLESS")|not)|.ws // empty' "$SNAP" 2>/dev/null)
+  fi
+
+  echo '[]' > "$BORROWED"
+  # Consume the snapshot. A snapshot left lying around from an earlier session
+  # would describe a layout that no longer means anything, and a later restore
+  # would faithfully re-apply it.
+  rm -f "$SNAP"
+  log "layout restored"
+}
+
+# Which physical monitor index is on the stream right now, or "none".
+cmd_streaming_index() {
+  local hl ids id owner i name
+  hl="$(headless)"
+  [ -n "$hl" ] || { echo none; return; }
+  ids="$(borrowed_ids)"
+  [ -n "$ids" ] || { echo none; return; }
+  id="$(printf '%s\n' "$ids" | head -1)"
+  owner="$(jq -r --argjson ws "$id" '.[]|select(.ws==$ws)|.name // empty' "$BORROWED" 2>/dev/null)"
+  [ -n "$owner" ] || { echo "?"; return; }
+  i=0
+  while read -r name; do
+    i=$((i+1))
+    [ "$name" = "$owner" ] && { echo "$i"; return; }
+  done < <(phys_names)
+  echo "?"
+}
+
+cmd_session() {
+  local base p ports
+  base="$(conf_value port)"; [[ "$base" =~ ^[0-9]+$ ]] || base=47989
+  # Sunshine's control/video ports relative to its base port.
+  ports="$base $((base-5)) $((base+21))"
+  have ss || { echo unknown; return; }
+  for p in $ports; do
+    if ss -tn state established "( sport = :$p )" 2>/dev/null | tail -n +2 | grep -q .; then
+      echo active; return
+    fi
+  done
+  echo idle
+}
+
+cmd_status() {
+  local hl streaming ready reason
+  hl="$(headless)"
+  streaming="$(cmd_streaming_index)"
+  if [ -n "$hl" ]; then ready=true; reason=""
+  else ready=false; reason="No headless display found. Create one with: stream-view ensure"; fi
+
+  if [ "${1:-}" = "--json" ]; then
+    local mons i=0 name
+    mons="$(
+      while read -r name; do
+        i=$((i+1))
+        printf '{"index":%d,"name":%s,"activeWs":%s}\n' "$i" \
+          "$(jq -Rn --arg v "$name" '$v')" \
+          "$(active_ws_on "$name" | jq -Rr 'tonumber? // null')"
+      done < <(phys_names) | paste -sd, -
+    )"
+    jq -n \
+      --arg streaming "$streaming" --arg headless "$hl" --arg reason "$reason" \
+      --argjson ready "$ready" --argjson monitors "[${mons}]" \
+      --arg session "$(cmd_session)" \
+      '{streaming: $streaming, ready: $ready, reason: $reason,
+        headless: (if $headless == "" then null else $headless end),
+        session: $session, monitors: $monitors}'
+  else
+    echo "ready:     $ready${reason:+  ($reason)}"
+    echo "streaming: $streaming"
+    echo "session:   $(cmd_session)"
+    echo "display:   ${hl:-none}"
+    local i=0 name
+    while read -r name; do
+      i=$((i+1)); echo "  monitor $i: $name (active workspace $(active_ws_on "$name"))"
+    done < <(phys_names)
+  fi
+}
+
+case "${1:-}" in
+  status)   shift; cmd_status "$@" ;;
+  show)     shift; cmd_show "$@" ;;
+  desktop)  cmd_desktop ;;
+  snapshot) cmd_snapshot ;;
+  restore)  cmd_restore ;;
+  session)  cmd_session ;;
+  ensure)   cmd_ensure ;;
+  *)
+    echo "usage: $(basename "$0") {status [--json]|show <n>|desktop|snapshot|restore|session|ensure}" >&2
+    exit 64 ;;
+esac
