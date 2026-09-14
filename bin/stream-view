@@ -21,7 +21,7 @@
 #   desktop           return borrowed workspaces; show the stream's own desktop
 #   snapshot          record the layout (call when a client connects)
 #   restore           put everything back (call when a client disconnects)
-#   session           print "active" or "idle" — is a client streaming right now
+#   session           print "active", "idle" or "unknown" — is a client streaming
 #   ensure            create a headless output if none exists
 #
 # Monitors are numbered by position, top-to-bottom then left-to-right, so the
@@ -41,7 +41,7 @@ IDLE_MODE="${STREAM_VIEW_IDLE_MODE:-1920x1080@60}"
 # The streaming display is parked this far to the right of every real monitor,
 # so neither windows nor the pointer can drift onto a screen nobody can see.
 PARK_GAP=5000
-SUNSHINE_UNIT="app-dev.lizardbyte.app.Sunshine.service"
+SUNSHINE_UNIT="${SUNSHINE_UNIT:-app-dev.lizardbyte.app.Sunshine.service}"
 # Optional: point at a Sunshine config to learn which output it captures and
 # which port it listens on. Absent or unreadable is fine; everything degrades.
 SUNSHINE_CONF="${SUNSHINE_CONF:-$HOME/.config/sunshine/sunshine.conf}"
@@ -76,15 +76,38 @@ conf_value() { # key
     tr -d '"' | tr -d "'"
 }
 
-# The output Sunshine captures. Prefer its configured output_name when that
-# output actually exists; otherwise fall back to any headless output present.
+any_headless() { monitors_json | jq -r '[.[]|select(.name|test("^HEADLESS"))|.name]|last // empty'; }
+
+# The streaming display: the headless output Sunshine captures. Its configured
+# output_name wins when that output exists. A physical monitor there is not a
+# streaming display, so this yields nothing and status says why. A name that
+# does not exist (a stale HEADLESS-1 after HEADLESS-2 got created) falls back
+# to whatever headless output is present.
 headless() {
   local want
   want="$(conf_value output_name)"
-  if [ -n "$want" ] && monitors_json | jq -e --arg o "$want" 'any(.[]; .name == $o)' >/dev/null 2>&1; then
-    printf '%s' "$want"; return 0
+  if [ -n "$want" ] && mon_exists "$want"; then
+    case "$want" in HEADLESS*) printf '%s' "$want" ;; esac
+    return 0
   fi
-  monitors_json | jq -r '[.[]|select(.name|test("^HEADLESS"))|.name]|last // empty'
+  any_headless
+}
+
+# The physical monitor Sunshine is configured to capture, if that is the case.
+captured_physical() {
+  local want
+  want="$(conf_value output_name)"
+  case "$want" in ""|HEADLESS*) return 0 ;; esac
+  mon_exists "$want" && printf '%s' "$want"
+}
+
+not_ready_reason() {
+  local phys; phys="$(captured_physical)"
+  if [ -n "$phys" ]; then
+    printf 'Sunshine is capturing %s, a physical monitor, not a display of its own. Run: stream-view setup' "$phys"
+  else
+    printf 'No headless display found. Run: stream-view setup'
+  fi
 }
 
 # Physical (non-headless) monitors, ordered top-to-bottom then left-to-right.
@@ -207,12 +230,13 @@ set_mode() { # output, WxH@R
 }
 
 cmd_ensure() {
-  local hl; hl="$(headless)"
+  local hl; hl="$(any_headless)"
 
   if [ -z "$hl" ]; then
     hyprctl output create headless >/dev/null 2>&1
     sleep 0.5
-    hl="$(monitors_json | jq -r '[.[]|select(.name|test("^HEADLESS"))|.name]|last // empty')"
+    MONITORS_CACHE=""
+    hl="$(any_headless)"
     [ -n "$hl" ] || { log "could not create a headless output"; return 1; }
     set_mode "$hl" "$IDLE_MODE"
     log "created streaming display $hl at $IDLE_MODE"
@@ -251,13 +275,13 @@ cmd_setup() {
 
   # Already pointed at a real headless output? Leave a working setup alone.
   want="$(conf_value output_name)"
-  if [ -n "$want" ] && monitors_json | jq -e --arg o "$want" 'any(.[]; .name == $o and (.name|test("^HEADLESS")))' >/dev/null 2>&1; then
+  if [ -n "$want" ] && [ "$(headless)" = "$want" ]; then
     log "Sunshine is already capturing $want — nothing to change"
     return 0
   fi
 
   cmd_ensure || return 1
-  hl="$(monitors_json | jq -r '[.[]|select(.name|test("^HEADLESS"))|.name]|last // empty')"
+  hl="$(any_headless)"
   [ -n "$hl" ] || { log "no streaming display to point Sunshine at"; return 1; }
 
   cp "$SUNSHINE_CONF" "$SUNSHINE_CONF.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null
@@ -327,7 +351,7 @@ cmd_show() {
 
   local hl name ws desc
   hl="$(headless)"
-  [ -n "$hl" ] || { log "no streaming display found; run: stream-view ensure"; exit 1; }
+  [ -n "$hl" ] || { log "$(not_ready_reason)"; exit 1; }
 
   name="$(phys_name "$n")"
   [ -n "$name" ] || { log "no physical monitor #$n"; exit 1; }
@@ -427,18 +451,64 @@ cmd_streaming_index() {
   echo "?"
 }
 
+# --- session detection ------------------------------------------------------
+#
+# Is a client streaming right now? Sunshine logs "CLIENT CONNECTED" and
+# "CLIENT DISCONNECTED" at info level and nothing in between, so the later of
+# the two is the answer. Nothing on the wire says this: the RTSP handshake is
+# ENet over UDP and video, audio and control are UDP, so a live stream holds
+# no TCP connection anyone could look for.
+#
+# The log file is preferred because Sunshine truncates it at every start, so a
+# file with no client lines means idle. The journal is the fallback, filtered
+# to the unit's current invocation for the same reason.
+
+sunshine_log_file() {
+  local p; p="$(conf_value log_path)"
+  case "$p" in
+    "") p="$(dirname "$SUNSHINE_CONF")/sunshine.log" ;;
+    /*) ;;
+    *)  p="$(dirname "$SUNSHINE_CONF")/$p" ;;
+  esac
+  printf '%s' "$p"
+}
+
+# Sunshine stopped, or crashed mid-stream, means nobody is streaming whatever
+# its last log line says. Only trusted when the unit is actually known.
+sunshine_unit_stopped() {
+  have systemctl || return 1
+  local st
+  st="$(systemctl --user show -p LoadState -p ActiveState --value "$SUNSHINE_UNIT" 2>/dev/null | paste -sd' ' -)"
+  [ "$st" = "loaded inactive" ] || [ "$st" = "loaded failed" ]
+}
+
 cmd_session() {
-  local base p ports
-  base="$(conf_value port)"; [[ "$base" =~ ^[0-9]+$ ]] || base=47989
-  # Sunshine's control/video ports relative to its base port.
-  ports="$base $((base-5)) $((base+21))"
-  have ss || { echo unknown; return; }
-  for p in $ports; do
-    if ss -tn state established "( sport = :$p )" 2>/dev/null | tail -n +2 | grep -q .; then
-      echo active; return
-    fi
-  done
-  echo idle
+  local level file inv last
+  # Below info level the client lines are never written; say so rather than
+  # reporting a stream that is quietly running as idle.
+  level="$(conf_value min_log_level)"
+  case "$level" in
+    warning|error|fatal|none) echo unknown; return ;;
+    [0-9]*) [ "$level" -gt 2 ] 2>/dev/null && { echo unknown; return; } ;;
+  esac
+
+  sunshine_unit_stopped && { echo idle; return; }
+
+  file="$(sunshine_log_file)"
+  if [ -r "$file" ]; then
+    last="$(grep -oE 'CLIENT (DIS)?CONNECTED' "$file" 2>/dev/null | tail -n 1)"
+  elif have journalctl && have systemctl; then
+    inv="$(systemctl --user show -p InvocationID --value "$SUNSHINE_UNIT" 2>/dev/null)"
+    [ -n "$inv" ] || { echo unknown; return; }
+    last="$(journalctl --user -o cat "_SYSTEMD_INVOCATION_ID=$inv" 2>/dev/null | grep -oE 'CLIENT (DIS)?CONNECTED' | tail -n 1)"
+  else
+    echo unknown; return
+  fi
+
+  case "$last" in
+    "CLIENT CONNECTED") echo active ;;
+    *) echo idle ;;
+  esac
 }
 
 cmd_status() {
@@ -446,7 +516,7 @@ cmd_status() {
   hl="$(headless)"
   streaming="$(cmd_streaming_index)"
   if [ -n "$hl" ]; then ready=true; reason=""
-  else ready=false; reason="No headless display found. Create one with: stream-view ensure"; fi
+  else ready=false; reason="$(not_ready_reason)"; fi
 
   if [ "${1:-}" = "--json" ]; then
     local mons i=0 name
@@ -501,7 +571,7 @@ usage: $(basename "$0") <command>
   desktop           hand back any borrowed workspace
   snapshot          record the current layout
   restore           put everything back
-  session           "active" or "idle"
+  session           "active", "idle" or "unknown"
   ensure            create and park the streaming display if missing
   setup             point Sunshine at the streaming display (one-off)
   client-start      size the display to the connecting client, then snapshot

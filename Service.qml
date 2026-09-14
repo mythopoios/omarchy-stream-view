@@ -22,7 +22,7 @@ Item {
   readonly property string tool: Qt.resolvedUrl("bin/stream-view").toString().replace("file://", "")
 
   // Seconds between checks. A stream that starts is noticed within one tick;
-  // the cost is one `ss` call, so this stays cheap.
+  // the cost is one read of Sunshine's log, so this stays cheap.
   readonly property int intervalMs: 5000
 
   property string session: "unknown"
@@ -43,8 +43,13 @@ Item {
     if (value === session) return
     session = value
 
-    if (value === "active") actionProc.command = [root.tool, "snapshot"]
-    else actionProc.command = [root.tool, "restore"]
+    if (value === "active") {
+      console.info("Stream View: client connected, saving the layout")
+      actionProc.command = [root.tool, "snapshot"]
+    } else {
+      console.info("Stream View: client disconnected, restoring the layout")
+      actionProc.command = [root.tool, "restore"]
+    }
 
     if (!actionProc.running) actionProc.running = true
   }
@@ -55,7 +60,13 @@ Item {
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.apply(text) }
   }
 
-  Process { id: actionProc }
+  Process {
+    id: actionProc
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: if (text.trim()) console.info(text.trim())
+    }
+  }
 
   Timer {
     interval: root.intervalMs

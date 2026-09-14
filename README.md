@@ -38,7 +38,7 @@ does not re-pin workspace ranges.
 
 - Hyprland 0.56 or newer, for the Lua dispatch API
 - Sunshine, already installed and paired with your Moonlight client
-- `jq` and `hyprctl` on `PATH`; `ss` (from `iproute2`) for session detection
+- `jq` and `hyprctl` on `PATH`
 
 ## Install
 
@@ -52,8 +52,9 @@ Then place it wherever you like on the bar:
 omarchy bar move io.github.mythopoios.stream-view --section right
 ```
 
-Open the panel. If Sunshine is not yet capturing a display of its own, the panel
-says so and offers a **Set up** button. That one click:
+Open the panel. If Sunshine is not yet capturing a display of its own, whether
+nothing is configured or it is pointed at one of your physical monitors, the
+panel says so and offers a **Set up** button. That one click:
 
 - creates a headless output and parks it well off to the side, where neither
   windows nor the pointer can wander onto it
@@ -86,8 +87,12 @@ thing runs automatically on disconnect.
 
 The bundled service polls every few seconds for an active Sunshine session,
 snapshots your layout when a client connects, and restores it when the client
-goes away. Nothing outside the plugin folder is touched, so uninstalling is just
-removing the directory.
+goes away. It reads Sunshine's own log for its `CLIENT CONNECTED` and
+`CLIENT DISCONNECTED` lines, so `min_log_level` needs to be `info` or lower,
+which is the default. A connect or disconnect is noticed within about five
+seconds; with several clients at once, the most recent event wins. Nothing
+outside the plugin folder is touched, so uninstalling is just removing the
+directory.
 
 If you would rather have exact timing, and want the streaming display to match
 each client's own resolution, Sunshine can drive it directly. Add this to
@@ -124,7 +129,7 @@ stream-view show <n>          put physical monitor n on the stream
 stream-view desktop           hand back any borrowed workspace
 stream-view snapshot          record the current layout
 stream-view restore           put everything back
-stream-view session           "active" or "idle"
+stream-view session           "active", "idle" or "unknown"
 stream-view ensure            create and park the streaming display if missing
 stream-view setup             point Sunshine at it (what the Set up button runs)
 stream-view client-start      size the display to the client, then snapshot
