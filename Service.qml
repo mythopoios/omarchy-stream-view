@@ -6,7 +6,8 @@ import Quickshell.Io
 //
 // Snapshots the desktop layout when a Moonlight client connects, and puts
 // everything back when it disconnects — so a borrowed workspace never stays
-// stranded on a headless output nobody is looking at.
+// stranded on a headless output nobody is looking at. The same two moments
+// swap the number keys in and out when that toggle is on.
 //
 // This polls rather than hooking Sunshine's prep-commands on purpose: it keeps
 // the whole plugin self-contained, so installing and removing it touches
@@ -45,10 +46,10 @@ Item {
 
     if (value === "active") {
       console.info("Stream View: client connected, saving the layout")
-      actionProc.command = [root.tool, "snapshot"]
+      actionProc.command = [root.tool, "session-start"]
     } else {
       console.info("Stream View: client disconnected, restoring the layout")
-      actionProc.command = [root.tool, "restore"]
+      actionProc.command = [root.tool, "session-end"]
     }
 
     if (!actionProc.running) actionProc.running = true

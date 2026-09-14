@@ -77,11 +77,28 @@ yourself — Set up does not appear and nothing is touched.
 
 Monitors are numbered by position, top to bottom then left to right, so the
 numbering is stable even when connector names change between boots. It works
-with any number of monitors, not just two.
+with any number of monitors, not just two; past three, the buttons wrap onto
+another row.
 
 **Recover** is the escape hatch. If anything ever looks stranded, it puts every
 window back on the workspace it was on when the session connected. The same
 thing runs automatically on disconnect.
+
+## Number keys
+
+Super+1 normally means "workspace 1" wherever it lives, so pressing it from the
+stream can throw focus onto a monitor back at the desk. Turn on **Number keys
+follow the stream** in the panel and, while a client is connected, Super+1 to 0
+pick the focused screen's own first to tenth workspace instead. On the
+streaming display that is its own set, whatever their numbers. Super+Shift
+moves a window there; Super+Shift+Alt moves it without following.
+
+This uses Hyprland's per-screen workspace selector, so it works with any number
+of monitors and with or without workspace rules. Keybinds are global, so while
+it is active the number row means "this screen's workspace N" at the desk as
+well. When the client disconnects, or you turn the toggle off, your own
+bindings come back with a config reload, the same thing Hyprland does when you
+edit its config.
 
 ## Connect and disconnect
 
@@ -129,6 +146,9 @@ stream-view show <n>          put physical monitor n on the stream
 stream-view desktop           hand back any borrowed workspace
 stream-view snapshot          record the current layout
 stream-view restore           put everything back
+stream-view session-start     snapshot, then swap the number keys in if enabled
+stream-view session-end       restore, then put the number keys back
+stream-view keys on|off|toggle  number keys follow the stream
 stream-view session           "active", "idle" or "unknown"
 stream-view ensure            create and park the streaming display if missing
 stream-view setup             point Sunshine at it (what the Set up button runs)

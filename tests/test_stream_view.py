@@ -33,7 +33,7 @@ elif args[0] == 'output' and args[1:] == ['create', 'headless']:
     d['workspaces'].append({'id': 30 + n, 'monitor': name, 'home': name})
     p.write_text(json.dumps(d))
     print('ok')
-elif args[0] == 'eval':
+elif args[0] in ('eval', 'reload'):
     print('ok')
 elif args[0] == 'dispatch':
     cmd = args[1]
@@ -114,6 +114,13 @@ class StreamViewTests(unittest.TestCase):
 
     def headless_outputs(self):
         return [m["name"] for m in self.state()["monitors"] if m["name"].startswith("HEADLESS")]
+
+    def hyprctl_calls(self, *kinds):
+        path = self.root / "calls"
+        if not path.exists():
+            return []
+        calls = [json.loads(line) for line in path.read_text().splitlines()]
+        return [c for c in calls if not kinds or c[0] in kinds]
 
     # --- borrowing and returning workspaces --------------------------------
 
@@ -215,6 +222,44 @@ class StreamViewTests(unittest.TestCase):
         stub.chmod(0o755)
         (self.root / "sunshine.log").write_text("[t]: Info: CLIENT CONNECTED\n")
         self.assertEqual(self.session(), "idle")
+
+    # --- number keys -------------------------------------------------------
+
+    def test_keys_toggle_is_remembered_and_reported(self):
+        self.assertFalse(self.status()["keys"])
+        self.assertEqual(self.run_command("keys", "on").stdout.strip(), "on")
+        self.assertTrue(self.status()["keys"])
+        self.assertEqual(self.run_command("keys", "toggle").stdout.strip(), "off")
+        self.assertFalse(self.status()["keys"])
+        self.assertEqual(self.hyprctl_calls("eval", "reload"), [])
+
+    def test_session_swaps_number_keys_in_and_back(self):
+        self.run_command("keys", "on")
+        self.run_command("session-start")
+        evals = self.hyprctl_calls("eval")
+        self.assertEqual(len(evals), 1)
+        self.assertTrue(evals[0][1].startswith("(function()"))   # eval takes an expression
+        self.assertIn('"r~" .. n', evals[0][1])
+        self.assertIn("hl.unbind", evals[0][1])
+        self.assertTrue((self.root / "stream-view/keys-applied").exists())
+        self.run_command("show", "1")
+        self.run_command("session-end")
+        self.assertIn(["reload", "config-only"], self.hyprctl_calls("reload"))
+        self.assertFalse((self.root / "stream-view/keys-applied").exists())
+        self.assertEqual(self.active("DP-3"), 1)
+        self.assertFalse((self.root / "stream-view/snapshot.json").exists())
+
+    def test_session_leaves_keys_alone_when_off(self):
+        self.run_command("session-start")
+        self.run_command("session-end")
+        self.assertEqual(self.hyprctl_calls("eval", "reload"), [])
+
+    def test_keys_apply_immediately_while_a_client_is_connected(self):
+        (self.root / "sunshine.log").write_text("[t]: Info: CLIENT CONNECTED\n")
+        self.run_command("keys", "on")
+        self.assertEqual([c[0] for c in self.hyprctl_calls("eval", "reload")], ["eval"])
+        self.run_command("keys", "off")
+        self.assertEqual([c[0] for c in self.hyprctl_calls("eval", "reload")], ["eval", "reload"])
 
 
 if __name__ == "__main__":

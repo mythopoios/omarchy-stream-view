@@ -27,12 +27,15 @@ Panel {
   property string reason: ""
   property string streaming: "none"      // "none" | "<monitor number>" | "?"
   property var monitors: []              // [{index, name, activeWs}]
+  property bool keys: false              // number keys follow the stream
   property bool cursorActive: false
   property int cursorIndex: 0
 
   readonly property int monCount: monitors.length
-  // Monitor buttons, then Desktop, then Recover.
-  readonly property int actionCount: monCount + 2
+  // Up to three monitor buttons per row; more wrap onto further rows.
+  readonly property int monColumns: Math.max(1, Math.min(3, monCount))
+  // Monitor buttons, then Desktop, Recover, and the number-keys toggle.
+  readonly property int actionCount: monCount + 3
 
   readonly property string iconMonitor: "󰍹"
   readonly property string iconDesktop: "󰇄"
@@ -65,6 +68,7 @@ Panel {
       root.reason = String(d.reason || "")
       root.streaming = String(d.streaming || "none")
       root.monitors = d.monitors || []
+      root.keys = d.keys === true
     } catch (e) {
       // Keep the last known state rather than flashing an empty panel.
     }
@@ -73,7 +77,24 @@ Panel {
   function actionCommand(i) {
     if (i < monCount) return "show " + monitors[i].index
     if (i === monCount) return "desktop"
-    return "restore"
+    if (i === monCount + 1) return "restore"
+    return "keys toggle"
+  }
+
+  // Arrow keys walk the monitor grid by row and column, then the two action
+  // buttons, then the toggle, wrapping at both ends.
+  function moveCursor(dx, dy) {
+    var i = cursorIndex
+    if (dy !== 0 && i < monCount) {
+      var next = i + dy * monColumns
+      if (next >= 0 && next < monCount) i = next
+      else if (dy > 0) i = monCount
+      else i = actionCount - 1
+    } else {
+      var step = (dx !== 0) ? dx : dy
+      i = (i + step + actionCount) % actionCount
+    }
+    cursorIndex = i
   }
 
   function activateAt(i) {
@@ -167,8 +188,7 @@ Panel {
       onMoveRequested: function(dx, dy) {
         if (!root.ready) return
         if (!root.cursorActive) { root.cursorActive = true; return }
-        var step = (dx !== 0) ? dx : dy
-        root.cursorIndex = (root.cursorIndex + step + root.actionCount) % root.actionCount
+        root.moveCursor(dx, dy)
       }
       onActivateRequested: if (root.ready && root.cursorActive) root.activateAt(root.cursorIndex)
       onCloseRequested: root.close()
@@ -276,21 +296,22 @@ Panel {
             fontFamily: root.bar.fontFamily
           }
 
-          Row {
-            id: monRow
+          Grid {
+            id: monGrid
             width: parent.width
-            spacing: Style.space(6)
+            columns: root.monColumns
+            columnSpacing: Style.space(6)
+            rowSpacing: Style.space(6)
 
-            readonly property real cellWidth: root.monCount > 0
-              ? (width - spacing * (root.monCount - 1)) / root.monCount
-              : width
+            readonly property real cellWidth:
+              (width - columnSpacing * (root.monColumns - 1)) / root.monColumns
 
             Repeater {
               model: root.monitors
               Button {
                 required property var modelData
                 required property int index
-                width: monRow.cellWidth
+                width: monGrid.cellWidth
                 iconText: root.iconMonitor
                 iconSize: Style.font.title
                 text: "Monitor " + modelData.index
@@ -353,11 +374,24 @@ Panel {
           }
         }
 
+        Toggle {
+          visible: root.ready
+          width: parent.width
+          label: "Number keys follow the stream"
+          description: "Super+1 to 0 pick the focused screen's own workspaces while a client is connected"
+          checked: root.keys
+          foreground: root.bar.foreground
+          fontFamily: root.bar.fontFamily
+          hasCursor: root.cursorActive && root.cursorIndex === root.monCount + 2
+          onClicked: root.activateAt(root.monCount + 2)
+          onHovered: function(h) { if (h) { root.cursorActive = true; root.cursorIndex = root.monCount + 2 } }
+        }
+
         Text {
           visible: root.ready
           width: parent.width
           textFormat: Text.PlainText
-          text: "Recover puts every window back on the workspace it was on when this session connected."
+          text: "Recover puts every workspace back on the monitor it was on when this session connected."
           color: Qt.darker(root.bar.foreground, 1.4)
           font.family: root.bar.fontFamily
           font.pixelSize: Style.font.caption

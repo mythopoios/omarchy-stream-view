@@ -19,8 +19,11 @@
 #   status [--json]   report readiness, which monitor is on the stream, topology
 #   show <n>          borrow physical monitor n's active workspace onto the stream
 #   desktop           return borrowed workspaces; show the stream's own desktop
-#   snapshot          record the layout (call when a client connects)
-#   restore           put everything back (call when a client disconnects)
+#   snapshot          record the layout
+#   restore           put everything back
+#   session-start     snapshot, then swap the number keys in if enabled (client connected)
+#   session-end       restore, then put the number keys back (client disconnected)
+#   keys on|off|toggle  Super+1..0 pick the focused screen's own workspaces while streaming
 #   session           print "active", "idle" or "unknown" — is a client streaming
 #   ensure            create a headless output if none exists
 #
@@ -34,6 +37,10 @@ set -uo pipefail
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/stream-view"
 SNAP="$STATE_DIR/snapshot.json"
 BORROWED="$STATE_DIR/borrowed.json"
+# The number-keys toggle. KEYS_FLAG is the user's choice; KEYS_APPLIED says the
+# binds are currently swapped in and a reload is owed to put them back.
+KEYS_FLAG="$STATE_DIR/keys"
+KEYS_APPLIED="$STATE_DIR/keys-applied"
 
 # Mode the streaming display sits at when no client is connected. Any client
 # that connects resizes it to its own resolution (see client-start).
@@ -327,6 +334,86 @@ install_autostart() {
 
 # Called by Sunshine's prep-cmd, when configured: size the streaming display to
 # the connecting client so the remote gets its own native resolution.
+# --- number keys ------------------------------------------------------------
+#
+# Hyprland's "r~N" selects the Nth workspace of the focused screen, skipping
+# workspaces that belong to other monitors. On the streaming display that is
+# its own first, second, third workspace whatever their numbers, with or
+# without workspace rules. Keybinds are global, so while this is applied the
+# number row means "this screen's workspace N" at the desk too. The user's own
+# binds come back with a config-only reload (monitors untouched), which is
+# what Hyprland does on any config edit; there is no API to read binds back.
+
+keys_enabled() { [ -e "$KEYS_FLAG" ]; }
+
+keys_apply() {
+  local lua
+  lua='(function() for i = 1, 10 do
+  local n, sym, code = tostring(i), tostring(i % 10), "code:" .. tostring(i + 9)
+  for _, mods in ipairs({ "SUPER + ", "SUPER + SHIFT + ", "SUPER + SHIFT + ALT + " }) do
+    pcall(hl.unbind, mods .. sym)
+    pcall(hl.unbind, mods .. code)
+  end
+  local ws = "r~" .. n
+  hl.bind("SUPER + " .. code, hl.dsp.focus({ workspace = ws }),
+    { description = "Workspace " .. n .. " on this screen (Stream View)" })
+  hl.bind("SUPER + SHIFT + " .. code, hl.dsp.window.move({ workspace = ws }),
+    { description = "Move window to workspace " .. n .. " on this screen (Stream View)" })
+  hl.bind("SUPER + SHIFT + ALT + " .. code, hl.dsp.window.move({ workspace = ws, follow = false }),
+    { description = "Move window silently to workspace " .. n .. " on this screen (Stream View)" })
+end end)()'
+  if hyprctl eval "$lua" >/dev/null 2>&1; then
+    : > "$KEYS_APPLIED"
+    log "number keys now pick the focused screen's own workspaces"
+  else
+    log "could not rebind the number keys (hyprctl eval failed)"
+    return 1
+  fi
+}
+
+keys_unapply() {
+  [ -e "$KEYS_APPLIED" ] || return 0
+  rm -f "$KEYS_APPLIED"
+  if hyprctl reload config-only >/dev/null 2>&1; then
+    log "number keys restored (config reloaded)"
+  else
+    log "could not reload the config to restore the number keys"
+    return 1
+  fi
+}
+
+cmd_keys() {
+  local action="${1:-status}"
+  case "$action" in
+    on)     : > "$KEYS_FLAG" ;;
+    off)    rm -f "$KEYS_FLAG" ;;
+    toggle) if keys_enabled; then rm -f "$KEYS_FLAG"; else : > "$KEYS_FLAG"; fi ;;
+    status) ;;
+    *) log "usage: stream-view keys on|off|toggle|status"; exit 64 ;;
+  esac
+  # Take effect now: swap in if a client is connected, or swap back out.
+  if [ "$action" != status ]; then
+    if keys_enabled; then
+      [ "$(cmd_session)" = active ] && keys_apply
+    else
+      keys_unapply
+    fi
+  fi
+  if keys_enabled; then echo on; else echo off; fi
+}
+
+# What the session watcher runs on connect and disconnect.
+cmd_session_start() {
+  cmd_snapshot
+  if keys_enabled; then keys_apply; fi
+  return 0
+}
+
+cmd_session_end() {
+  cmd_restore
+  keys_unapply
+}
+
 cmd_client_start() {
   local hl w h f
   hl="$(headless)"; [ -n "$hl" ] || return 0
@@ -336,11 +423,11 @@ cmd_client_start() {
     set_mode "$hl" "${w}x${h}@${f}"
     log "streaming display sized to ${w}x${h}@${f}"
   fi
-  cmd_snapshot
+  cmd_session_start
 }
 
 cmd_client_stop() {
-  cmd_restore
+  cmd_session_end
   local hl; hl="$(headless)"
   [ -n "$hl" ] && set_mode "$hl" "$IDLE_MODE"
 }
@@ -532,13 +619,15 @@ cmd_status() {
       --arg streaming "$streaming" --arg headless "$hl" --arg reason "$reason" \
       --argjson ready "$ready" --argjson monitors "[${mons}]" \
       --arg session "$(cmd_session)" \
+      --argjson keys "$(keys_enabled && echo true || echo false)" \
       '{streaming: $streaming, ready: $ready, reason: $reason,
         headless: (if $headless == "" then null else $headless end),
-        session: $session, monitors: $monitors}'
+        session: $session, keys: $keys, monitors: $monitors}'
   else
     echo "ready:     $ready${reason:+  ($reason)}"
     echo "streaming: $streaming"
     echo "session:   $(cmd_session)"
+    echo "keys:      $(keys_enabled && echo on || echo off)"
     echo "display:   ${hl:-none}"
     local i=0 name
     while read -r name; do
@@ -557,6 +646,9 @@ case "${1:-}" in
   desktop)  cmd_desktop ;;
   snapshot) cmd_snapshot ;;
   restore)  cmd_restore ;;
+  session-start) cmd_session_start ;;
+  session-end)   cmd_session_end ;;
+  keys)     shift; cmd_keys "$@" ;;
   session)  cmd_session ;;
   ensure)   cmd_ensure ;;
   setup)    cmd_setup ;;
@@ -571,6 +663,9 @@ usage: $(basename "$0") <command>
   desktop           hand back any borrowed workspace
   snapshot          record the current layout
   restore           put everything back
+  session-start     snapshot, then swap the number keys in if enabled
+  session-end       restore, then put the number keys back
+  keys on|off|toggle  number keys pick the focused screen's own workspaces while streaming
   session           "active", "idle" or "unknown"
   ensure            create and park the streaming display if missing
   setup             point Sunshine at the streaming display (one-off)
