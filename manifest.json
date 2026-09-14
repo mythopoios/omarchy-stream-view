@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.mythopoios.stream-view",
   "name": "Stream View",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "mythopoios",
   "license": "MIT",
   "homepage": "https://github.com/mythopoios/omarchy-stream-view",

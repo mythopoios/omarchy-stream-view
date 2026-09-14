@@ -44,8 +44,13 @@ Panel {
   // the button says so rather than looking like it did nothing.
   property bool busy: false
 
-  function run(args) { if (root.bar) root.bar.run(root.tool + " " + args) }
-  function refresh() { if (!statusProc.running) statusProc.running = true }
+  property bool refreshingAgain: false
+  readonly property bool switching: actionProc.running
+
+  function refresh() {
+    if (statusProc.running) refreshingAgain = true
+    else statusProc.running = true
+  }
 
   function runSetup() {
     if (busy) return
@@ -72,9 +77,9 @@ Panel {
   }
 
   function activateAt(i) {
-    if (i < 0 || i >= actionCount) return
-    run(actionCommand(i))
-    settleTimer.restart()
+    if (i < 0 || i >= actionCount || switching) return
+    actionProc.command = [root.tool].concat(actionCommand(i).split(" "))
+    actionProc.running = true
   }
 
   // The base Panel already registers open/close/toggle on `ipcTarget`.
@@ -83,6 +88,27 @@ Panel {
     id: statusProc
     command: [root.tool, "status", "--json"]
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.applyStatus(text) }
+    onExited: {
+      if (root.refreshingAgain) {
+        root.refreshingAgain = false
+        root.refresh()
+      }
+    }
+  }
+
+  Process {
+    id: actionProc
+    property double startedAt: 0
+    onStarted: startedAt = Date.now()
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: if (text.trim()) console.info(text.trim())
+    }
+    onExited: function(exitCode) {
+      console.info("Stream View action completed in " + (Date.now() - startedAt)
+                   + " ms (exit " + exitCode + ")")
+      root.refresh()
+    }
   }
 
   Process {
@@ -97,7 +123,6 @@ Panel {
   }
 
   Timer { id: setupSettle; interval: 1500; repeat: false; onTriggered: root.refresh() }
-  Timer { id: settleTimer; interval: 350; repeat: false; onTriggered: root.refresh() }
   Timer { interval: 4000; running: root.opened; repeat: true; onTriggered: root.refresh() }
 
   onOpenedChanged: {

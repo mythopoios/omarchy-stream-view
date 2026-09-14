@@ -58,7 +58,17 @@ done
 
 # --- topology --------------------------------------------------------------
 
-monitors_json() { hyprctl monitors -j 2>/dev/null; }
+# Reuse one topology snapshot during a command. A move invalidates the changing
+# data; rules remain valid for the short lifetime of this process.
+MONITORS_CACHE="" WORKSPACES_CACHE="" RULES_CACHE=""
+monitors_json() { if [ -n "$MONITORS_CACHE" ]; then printf '%s' "$MONITORS_CACHE"; else hyprctl monitors -j 2>/dev/null; fi; }
+workspaces_json() { if [ -n "$WORKSPACES_CACHE" ]; then printf '%s' "$WORKSPACES_CACHE"; else hyprctl workspaces -j 2>/dev/null; fi; }
+rules_json() { if [ -n "$RULES_CACHE" ]; then printf '%s' "$RULES_CACHE"; else hyprctl workspacerules -j 2>/dev/null; fi; }
+load_topology() {
+  [ -n "$MONITORS_CACHE" ] || MONITORS_CACHE="$(hyprctl monitors -j 2>/dev/null)"
+  [ -n "$WORKSPACES_CACHE" ] || WORKSPACES_CACHE="$(hyprctl workspaces -j 2>/dev/null)"
+  [ -n "$RULES_CACHE" ] || RULES_CACHE="$(hyprctl workspacerules -j 2>/dev/null)"
+}
 
 conf_value() { # key
   [ -r "$SUNSHINE_CONF" ] || return 0
@@ -89,12 +99,12 @@ phys_name() { phys_names | sed -n "${1}p"; }
 mon_desc() { monitors_json | jq -r --arg n "$1" '.[]|select(.name==$n)|.description // empty'; }
 mon_exists() { monitors_json | jq -e --arg n "$1" 'any(.[]; .name == $n)' >/dev/null 2>&1; }
 active_ws_on() { monitors_json | jq -r --arg n "$1" '.[]|select(.name==$n)|.activeWorkspace.id // empty'; }
-ws_monitor() { hyprctl workspaces -j 2>/dev/null | jq -r --arg id "$1" '.[]|select(.id==($id|tonumber))|.monitor // empty'; }
+ws_monitor() { workspaces_json | jq -r --arg id "$1" '.[]|select(.id==($id|tonumber))|.monitor // empty'; }
 
 # A workspace's home per its workspace_rule, when one exists. Only a fallback:
 # many setups have no per-monitor workspace rules at all.
 ws_rule_home() {
-  hyprctl workspacerules -j 2>/dev/null |
+  rules_json |
     jq -r --arg id "$1" '.[]|select(.workspaceString==$id)|.monitor // empty'
 }
 
@@ -102,7 +112,8 @@ ws_rule_home() {
 
 move_ws() { # workspace-id, monitor-selector
   [ -n "${2:-}" ] || return 1
-  hyprctl dispatch "hl.dsp.workspace.move({ workspace = $1, monitor = \"$2\" })" >/dev/null 2>&1
+  hyprctl dispatch "hl.dsp.workspace.move({ workspace = $1, monitor = \"$2\" })" >/dev/null 2>&1 || return 1
+  MONITORS_CACHE="" WORKSPACES_CACHE=""
 }
 
 focus_monitor() { hyprctl dispatch "hl.dsp.focus({ monitor = \"$1\" })" >/dev/null 2>&1; }
@@ -160,7 +171,7 @@ borrowed_ids() {
       [ -n "$id" ] || continue
       rule="$(ws_rule_home "$id")"
       [ -n "$rule" ] && [ "$rule" != "$hl" ] && echo "$id"
-    done < <(hyprctl workspaces -j 2>/dev/null | jq -r --arg hl "$hl" '.[]|select(.monitor==$hl)|.id')
+    done < <(workspaces_json | jq -r --arg hl "$hl" '.[]|select(.monitor==$hl)|.id')
   } | sort -un | while read -r id; do
     [ -n "$id" ] || continue
     # Only report it as borrowed if it is actually on the headless output now.
@@ -323,7 +334,11 @@ cmd_show() {
 
   # Already showing this monitor: nothing to do.
   local shown; shown="$(cmd_streaming_index)"
-  if [ "$shown" = "$n" ]; then focus_monitor "$hl"; log "already streaming monitor $n"; return 0; fi
+  if [ "$shown" = "$n" ]; then
+    ws="$(borrowed_ids | head -1)"
+    [ -n "$ws" ] && focus_ws "$ws"
+    log "already streaming monitor $n"; return 0
+  fi
 
   # Establish a baseline if the session watcher has not got to it yet, so the
   # very first borrow of a session is still recoverable.
@@ -332,13 +347,17 @@ cmd_show() {
   # Return whatever is borrowed first, then read the target's active workspace,
   # so switching between monitors picks up the right one.
   release_all
+  load_topology
   ws="$(active_ws_on "$name")"
   [ -n "$ws" ] || { log "monitor $n ($name) has no active workspace"; exit 1; }
 
   desc="$(mon_desc "$name")"
   borrow_record "$ws" "$name" "$desc"
-  move_ws "$ws" "$hl"
-  focus_monitor "$hl"
+  move_ws "$ws" "$hl" || { log "failed to move workspace $ws"; return 1; }
+  # Moving an active workspace only makes it visible automatically when its
+  # source monitor has focus. From Moonlight, focus is on the headless output,
+  # so selecting just the monitor would leave its previous desktop visible.
+  focus_ws "$ws" || { log "failed to show workspace $ws"; return 1; }
   log "streaming monitor $n ($name), workspace $ws"
 }
 
@@ -351,7 +370,7 @@ cmd_desktop() {
 
 cmd_snapshot() {
   local ws mon
-  ws="$(hyprctl workspaces -j 2>/dev/null)"
+  ws="$(workspaces_json)"
   mon="$(monitors_json)"
   [ -n "$ws" ] && [ -n "$mon" ] || { log "could not read layout"; return 1; }
   jq -n --argjson ws "$ws" --argjson mon "$mon" '{
@@ -457,6 +476,10 @@ cmd_status() {
     done < <(phys_names)
   fi
 }
+
+case "${1:-}" in
+  show|desktop|restore|status) load_topology ;;
+esac
 
 case "${1:-}" in
   status)   shift; cmd_status "$@" ;;
